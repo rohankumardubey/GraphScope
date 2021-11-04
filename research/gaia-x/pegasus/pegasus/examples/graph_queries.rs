@@ -14,7 +14,7 @@ lazy_static! {
 
 fn main() {
     let mut conf = JobConf::new("apply_bug1");
-    conf.set_workers(1);
+    conf.set_workers(4);
     let mut result = pegasus::run(conf, move || {
         let index = pegasus::get_current_worker().index;
         move |input, output| {
