@@ -5,6 +5,7 @@ authors = ["chenqiang.mcq <chenqiang.mcq@alibaba-inc.com>"]
 edition = "2018"
 
 [dependencies]
+graph_store = { path = "../../../graph_store" }
 pegasus_common = { path = "../common" }
 pegasus_memory = { path = "../memory" }
 pegasus_network = { path = "../network" }
