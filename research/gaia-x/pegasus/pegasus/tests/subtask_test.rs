@@ -13,9 +13,8 @@
 //! See the License for the specific language governing permissions and
 //! limitations under the License.
 
-use pegasus::api::{CorrelatedSubTask, Count, Map, Sink, HasAny, Limit};
+use pegasus::api::{CorrelatedSubTask, Count, Map, Sink, HasAny};
 use pegasus::JobConf;
-use std::collections::HashMap;
 
 #[test]
 fn apply_x_map_flatmap_count_x_test() {
