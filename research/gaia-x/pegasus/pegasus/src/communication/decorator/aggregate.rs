@@ -14,7 +14,7 @@ pub struct AggregateBatchPush<D: Data> {
 
 impl<D: Data> AggregateBatchPush<D> {
     pub fn new(target: u32, info: ChannelInfo, pushes: Vec<EventEmitPush<D>>) -> Self {
-        assert_eq!(info.scope_level, 0);
+        // assert_eq!(info.scope_level, 0);
         let source = crate::worker_id::get_current_worker().index;
         let mut vec = vec![];
         for mut p in pushes {

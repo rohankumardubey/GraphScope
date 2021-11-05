@@ -13,8 +13,9 @@
 //! See the License for the specific language governing permissions and
 //! limitations under the License.
 
-use pegasus::api::{CorrelatedSubTask, Count, Map, Sink, HasAny};
+use pegasus::api::{CorrelatedSubTask, Count, Map, Sink, HasAny, Limit};
 use pegasus::JobConf;
+use std::collections::HashMap;
 
 #[test]
 fn apply_x_map_flatmap_count_x_test() {
@@ -175,4 +176,69 @@ fn apply_x_flatmap_any_x_test() {
     }
 
     assert_eq!(count, 2000);
+}
+
+fn read_test_data1() -> HashMap<u64, Vec<u64>> {
+    use std::io::{BufReader, BufRead};
+    use std::fs::File;
+
+    let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
+    let reader = BufReader::new(File::open("tests/data/bug1_data.csv").unwrap());
+    for _line in reader.lines() {
+        let line = _line.unwrap();
+        let mut data = line.split('|');
+        let v = data.next().unwrap().parse().unwrap();
+        let nbr: Vec<u64> = data.map(|s|s.parse().unwrap()).collect();
+        map.entry(v)
+            .or_insert_with(Vec::new)
+            .extend(nbr.into_iter());
+    }
+    map
+}
+
+#[test]
+fn apply_flatmap_limit_unexpected_results() {
+    use std::sync::Arc;
+
+    let mut conf = JobConf::new("apply_flatmap_limit_unexpected_results");
+    let datasets = read_test_data1();
+    let data = Arc::new(datasets);
+    let expected_cnt = data.len() as u64;
+
+    conf.set_workers(4);
+    let mut result = pegasus::run(conf, move || {
+        let index = pegasus::get_current_worker().index;
+        let data_cloned1 = data.clone();
+        let data_cloned2 = data.clone();
+
+        move |input, output| {
+            let src = if index == 0 {
+                input.input_from({
+                    let vec: Vec<u64> = data_cloned1.keys().map(|x| *x).collect();
+                    vec.into_iter()
+                })?
+            } else {
+                input.input_from(vec![].into_iter())?
+            };
+            src
+                .apply(move |sub| {
+                    sub.repartition(|v| Ok(*v))
+                        .flat_map(move |v| {
+                            let vec: Vec<u64> = data_cloned2.get(&v).unwrap().iter()
+                                .map(|x| *x).collect();
+                            Ok(vec.into_iter())
+                        })?
+                        .limit(1)?
+                        .count()
+                })?
+                .filter_map(|(v, cnt)| if cnt == 0 { Ok(None) } else { Ok(Some(v)) })?
+                .count()?
+                .sink_into(output)
+        }
+    })
+        .expect("build job failure");
+
+    while let Some(Ok(cnt)) = result.next() {
+        assert_eq!(cnt, expected_cnt);
+    }
 }
