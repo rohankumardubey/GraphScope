@@ -1095,6 +1095,7 @@ dependencies = [
  "log",
  "log4rs",
  "rand 0.7.3",
+ "rand 0.8.4",
  "serde",
  "smallvec",
  "time",

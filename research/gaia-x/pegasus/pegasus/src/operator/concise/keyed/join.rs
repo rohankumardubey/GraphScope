@@ -15,7 +15,7 @@
 
 use ahash::AHashMap;
 
-use crate::api::{Binary, Join, HasKey, PartitionByKey};
+use crate::api::{Binary, HasKey, Join, PartitionByKey};
 use crate::communication::output::OutputSession;
 use crate::communication::Output;
 use crate::errors::{BuildJobError, JobExecError};
@@ -89,8 +89,8 @@ impl<L: Data + HasKey, R: Data + HasKey> Helper<L, R> {
 fn insert_and_query<'a, L: Data + HasKey, R: Data + HasKey<Target = L::Target>>(
     map1: &mut JoinMap<L>, map2: &'a mut JoinMap<R>, data: &L, need_insert: bool,
 ) -> Option<&'a Vec<R>>
-    where
-        L::Target: Clone + Send,
+where
+    L::Target: Clone + Send,
 {
     let k = data.get_key();
     let entry1 = map1
@@ -170,8 +170,8 @@ fn try_semi_join_output<L: Data + HasKey, R: Data + HasKey>(
 fn internal_inner_join<L: Data + HasKey, R: Data + HasKey<Target = L::Target>>(
     this: Stream<L>, other: Stream<R>,
 ) -> Result<Stream<(L, R)>, BuildJobError>
-    where
-        L::Target: Clone + Send,
+where
+    L::Target: Clone + Send,
 {
     this.partition_by_key()
         .binary("inner_join", other, |info| {
@@ -208,8 +208,8 @@ fn internal_inner_join<L: Data + HasKey, R: Data + HasKey<Target = L::Target>>(
 fn internal_outer_join<L: Data + HasKey, R: Data + HasKey<Target = L::Target>>(
     this: Stream<L>, other: Stream<R>, join_type: JoinType,
 ) -> Result<Stream<(Option<L>, Option<R>)>, BuildJobError>
-    where
-        L::Target: Clone + Send,
+where
+    L::Target: Clone + Send,
 {
     let (output_left, output_right) = match join_type {
         JoinType::LeftOuter => (true, false),
@@ -217,85 +217,99 @@ fn internal_outer_join<L: Data + HasKey, R: Data + HasKey<Target = L::Target>>(
         JoinType::FullOuter => (true, true),
         _ => return Err(BuildJobError::from("wrong join type".to_string())),
     };
-    this.partition_by_key().binary(format!("{:?}", join_type).as_str(), other, |info| {
-        let mut helper = Helper::<L, R>::new(info.scope_level);
-        move |left, right, output| {
-            left.for_each_batch(|dataset| {
-                let mut session = output.new_session(&dataset.tag)?;
-                let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
-                for l in dataset.drain() {
-                    if let Some(arr) = insert_and_query(&mut l_map, &mut r_map, &l, true) {
-                        for r in arr {
-                            session.give((Some(l.clone()), Some(r.clone())))?;
+    this.partition_by_key()
+        .binary(format!("{:?}", join_type).as_str(), other, |info| {
+            let mut helper = Helper::<L, R>::new(info.scope_level);
+            move |left, right, output| {
+                left.for_each_batch(|dataset| {
+                    let mut session = output.new_session(&dataset.tag)?;
+                    let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
+                    for l in dataset.drain() {
+                        if let Some(arr) = insert_and_query(&mut l_map, &mut r_map, &l, true) {
+                            for r in arr {
+                                session.give((Some(l.clone()), Some(r.clone())))?;
+                            }
                         }
                     }
-                }
-                if dataset.is_last() {
-                    helper.set_left_end(&dataset.tag);
-                    try_outer_join_output(&mut helper, session, output_left, output_right, &dataset.tag)?;
-                }
-                Ok(())
-            })?;
-            right.for_each_batch(|dataset| {
-                let mut session = output.new_session(&dataset.tag)?;
-                let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
-                for r in dataset.drain() {
-                    if let Some(arr) = insert_and_query(&mut r_map, &mut l_map, &r, true) {
-                        for l in arr {
-                            session.give((Some(l.clone()), Some(r.clone())))?;
+                    if dataset.is_last() {
+                        helper.set_left_end(&dataset.tag);
+                        try_outer_join_output(
+                            &mut helper,
+                            session,
+                            output_left,
+                            output_right,
+                            &dataset.tag,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                right.for_each_batch(|dataset| {
+                    let mut session = output.new_session(&dataset.tag)?;
+                    let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
+                    for r in dataset.drain() {
+                        if let Some(arr) = insert_and_query(&mut r_map, &mut l_map, &r, true) {
+                            for l in arr {
+                                session.give((Some(l.clone()), Some(r.clone())))?;
+                            }
                         }
                     }
-                }
-                if dataset.is_last() {
-                    helper.set_right_end(&dataset.tag);
-                    try_outer_join_output(&mut helper, session, output_left, output_right, &dataset.tag)?;
-                }
+                    if dataset.is_last() {
+                        helper.set_right_end(&dataset.tag);
+                        try_outer_join_output(
+                            &mut helper,
+                            session,
+                            output_left,
+                            output_right,
+                            &dataset.tag,
+                        )?;
+                    }
+                    Ok(())
+                })?;
                 Ok(())
-            })?;
-            Ok(())
-        }
-    })
+            }
+        })
 }
 
 fn internal_semi_join<L: Data + HasKey, R: Data + HasKey<Target = L::Target>>(
     this: Stream<L>, other: Stream<R>, join_type: JoinType,
 ) -> Result<Stream<L>, BuildJobError>
-    where
-        L::Target: Clone + Send,
+where
+    L::Target: Clone + Send,
 {
     let is_anti = match join_type {
         JoinType::Semi => false,
         JoinType::Anti => true,
         _ => return Err(BuildJobError::from("wrong join type".to_string())),
     };
-    this.partition_by_key().binary(format!("{:?}", join_type).as_str(), other, |info| {
-        let mut helper = Helper::<L, R>::new(info.scope_level);
-        move |left, right, output| {
-            left.for_each_batch(|dataset| {
-                let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
-                for l in dataset.drain() {
-                    insert_and_query(&mut l_map, &mut r_map, &l, true);
-                }
-                if dataset.is_last() {
-                    helper.set_left_end(&dataset.tag);
-                    try_semi_join_output(&mut helper, output, is_anti, &dataset.tag)?;
-                }
+    this.partition_by_key()
+        .binary(format!("{:?}", join_type).as_str(), other, |info| {
+            let mut helper = Helper::<L, R>::new(info.scope_level);
+            move |left, right, output| {
+                left.for_each_batch(|dataset| {
+                    let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
+                    for l in dataset.drain() {
+                        insert_and_query(&mut l_map, &mut r_map, &l, true);
+                    }
+                    if dataset.is_last() {
+                        helper.set_left_end(&dataset.tag);
+                        try_semi_join_output(&mut helper, output, is_anti, &dataset.tag)?;
+                    }
+                    Ok(())
+                })?;
+                right.for_each_batch(|dataset| {
+                    let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
+                    for r in dataset.drain() {
+                        insert_and_query(&mut r_map, &mut l_map, &r, false);
+                    }
+                    if dataset.is_last() {
+                        helper.set_right_end(&dataset.tag);
+                        try_semi_join_output(&mut helper, output, is_anti, &dataset.tag)?;
+                    }
+                    Ok(())
+                })?;
                 Ok(())
-            })?;
-            right.for_each_batch(|dataset| {
-                let (mut l_map, mut r_map) = helper.get_maps_mut(&dataset.tag);
-                for r in dataset.drain() {
-                    insert_and_query(&mut r_map, &mut l_map, &r, false);
-                }
-                if dataset.is_last() {
-                    helper.set_right_end(&dataset.tag);
-                    try_semi_join_output(&mut helper, output, is_anti, &dataset.tag)?;
-                }
-                Ok(())
-            })?;
-            Ok(())
-        }
-    })
+            }
+        })
 }
 
 impl<L: Data + HasKey, R: Data + HasKey<Target = L::Target>> Join<L, R> for Stream<L> {

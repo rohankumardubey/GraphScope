@@ -1,8 +1,8 @@
 #[macro_use]
 extern crate lazy_static;
 use graph_store::prelude::*;
+use pegasus::api::{CorrelatedSubTask, Count, Limit, Map, Sink};
 use pegasus::JobConf;
-use pegasus::api::{Limit, CorrelatedSubTask, Map, Count, Sink};
 
 lazy_static! {
     pub static ref GRAPH: LargeGraphDB<DefaultId, InternalId> = GraphDBConfig::default()
@@ -49,7 +49,7 @@ fn main() {
                 .sink_into(output)
         }
     })
-        .expect("build job failure");
+    .expect("build job failure");
 
     while let Some(Ok(cnt)) = result.next() {
         assert_eq!(cnt, 1000);
