@@ -344,7 +344,7 @@ fn apply_flatmap_limit_unexpected_results3() {
                         .limit(1)?
                         .count()
                 })?
-                .filter_map(|(v, cnt)| if cnt == 0 { Ok(None) } else { Ok(Some(v)) })?
+                //.filter_map(|(v, cnt)| if cnt == 0 { Ok(None) } else { Ok(Some(v)) })?
                 .count()?
                 .sink_into(output)
         }
