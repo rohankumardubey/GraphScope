@@ -13,7 +13,7 @@
 //! See the License for the specific language governing permissions and
 //! limitations under the License.
 
-use pegasus::api::{CorrelatedSubTask, Count, HasAny, Map, Sink};
+use pegasus::api::{CorrelatedSubTask, Count, HasAny, Map, Sink, Limit, Filter};
 use pegasus::JobConf;
 use std::collections::HashMap;
 
@@ -178,18 +178,18 @@ fn apply_x_flatmap_any_x_test() {
     assert_eq!(count, 2000);
 }
 
-fn read_test_data(filename: &str) -> HashMap<u64, Vec<u64>> {
+fn read_test_data<T: Eq + Default + std::hash::Hash + std::str::FromStr>(filename: &str) -> HashMap<T, Vec<T>> {
     use std::io::{BufReader, BufRead};
     use std::fs::File;
 
-    let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut map: HashMap<T, Vec<T>> = HashMap::new();
     let reader = BufReader::new(File::open(filename).unwrap());
     for _line in reader.lines() {
         let line = _line.unwrap();
         let mut data = line.split('|');
         let data_str = data.next().unwrap();
-        let v = data_str.parse().expect(&format!("{:?} cannot parse int", data_str));
-        let nbr: Vec<u64> = data.map(|s|s.parse().unwrap()).collect();
+        let v = data_str.parse::<T>().unwrap_or_default();
+        let nbr: Vec<T> = data.map(|s|s.parse::<T>().unwrap_or_default()).collect();
         map.entry(v)
             .or_insert_with(Vec::new)
             .extend(nbr.into_iter());
@@ -197,12 +197,36 @@ fn read_test_data(filename: &str) -> HashMap<u64, Vec<u64>> {
     map
 }
 
+
 #[macro_use]
 extern crate lazy_static;
 
+#[derive(Hash, PartialEq, Eq, Default, Debug, Copy, Clone,)]
+pub struct Tuple (u64, u8);
+
+impl std::str::FromStr for Tuple {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.strip_prefix('(').unwrap().strip_suffix(')').unwrap();
+        let mut splitter = s.split(", ");
+        let s1 = splitter.next().unwrap();
+        let s2 = splitter.next().unwrap();
+
+        Ok(Tuple(s1.parse::<u64>()?, s2.parse::<u8>()?))
+    }
+}
+
+impl From<(u64, u8)> for Tuple {
+    fn from(t: (u64, u8)) -> Self {
+        Self(t.0, t.1)
+    }
+}
+
 lazy_static! {
-    pub static ref MAP1: HashMap<u64, Vec<u64>> = read_test_data("tests/data/bug1_data.csv");
-    pub static ref MAP2: HashMap<u64, Vec<u64>> = read_test_data("tests/data/bug2_data.csv");
+    pub static ref MAP1: HashMap<u64, Vec<u64>> = read_test_data::<u64>("tests/data/bug1_data.csv");
+    pub static ref MAP2: HashMap<u64, Vec<u64>> = read_test_data::<u64>("tests/data/bug2_data.csv");
+    pub static ref MAP3: HashMap<Tuple, Vec<Tuple>> = read_test_data::<Tuple>("tests/data/bug3_data.csv");
 }
 
 #[test]
@@ -272,6 +296,51 @@ fn apply_flatmap_limit_unexpected_results2() {
                         .flat_map(|v|Ok(MAP2.get(&v).unwrap().iter().map(|x| *x)))?
                         .repartition(|v| Ok(*v))
                         .flat_map(|v| Ok(MAP2.get(&v).unwrap().iter().map(|x| *x)))?
+                        .limit(1)?
+                        .count()
+                })?
+                .filter_map(|(v, cnt)| if cnt == 0 { Ok(None) } else { Ok(Some(v)) })?
+                .count()?
+                .sink_into(output)
+        }
+    })
+        .expect("build job failure");
+
+    while let Some(Ok(cnt)) = result.next() {
+        assert_eq!(cnt, expected_cnt);
+    }
+}
+
+#[test]
+fn apply_flatmap_limit_unexpected_results3() {
+    let mut conf = JobConf::new("apply_flatmap_limit_unexpected_results3");
+    let src_v: u64 = 1 << 56 | 17592186044810;
+    let expected_cnt: u64 = 1000;
+
+    conf.set_workers(4);
+    let mut result = pegasus::run(conf, move || {
+        let index = pegasus::get_current_worker().index;
+        move |input, output| {
+            let src = if index == 0 {
+                input.input_from(
+                    MAP3.get(&Tuple(src_v, 1)).unwrap()
+                        .iter()
+                        .map(|t| (t.0, t.1))
+                )?
+            } else {
+                input.input_from(vec![].into_iter())?
+            };
+            src.flat_map(|v| Ok(
+                MAP3.get(&v.into()).unwrap().iter().map(|t| (t.0, t.1)))
+            )?
+                .limit(expected_cnt as u32)?
+                // .map(|(v, _)| Ok(v))?
+                .apply(|sub| {
+                    sub.repartition(|v| Ok(v.0))
+                        .flat_map(|v| {
+                            Ok(MAP3.get(&v.into()).unwrap().iter().map(|t| (t.0, t.1)))
+                        })?
+                        .filter(|t| Ok(t.1 == 3))?
                         .limit(1)?
                         .count()
                 })?
