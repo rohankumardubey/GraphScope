@@ -28,7 +28,7 @@ use crate::data::{EndOfScope, MicroBatch};
 use crate::data_plane::Push;
 use crate::errors::IOError;
 use crate::graph::Port;
-use crate::progress::{EndSignal, Weight};
+use crate::progress::{DynPeers};
 use crate::tag::tools::map::TidyTagMap;
 use crate::{Data, Tag};
 
@@ -176,8 +176,8 @@ impl<D: Data> ExchangeMicroBatchPush<D> {
         Ok(())
     }
 
-    fn update_end(&mut self, target: Option<usize>, end: &EndOfScope) -> Vec<EndSignal> {
-        let mut push_stat = vec![];
+    fn update_end(&mut self, target: Option<usize>, end: &EndOfScope) -> impl Iterator<Item = (usize, DynPeers)> {
+        let mut push_stat = Vec::with_capacity(self.pushes.len());
         for (index, p) in self.pushes.iter().enumerate() {
             let mut pushes = p.get_push_count(&end.tag).unwrap_or(0);
             if let Some(target) = target {
@@ -189,9 +189,9 @@ impl<D: Data> ExchangeMicroBatchPush<D> {
         }
 
         let weight = if end.tag.is_root() {
-            Weight::all()
+            DynPeers::all()
         } else {
-            let mut weight = Weight::partial_empty();
+            let mut weight = DynPeers::empty();
             for (i, p) in push_stat.iter().enumerate() {
                 if *p > 0 {
                     weight.add_source(i as u32);
@@ -207,14 +207,7 @@ impl<D: Data> ExchangeMicroBatchPush<D> {
             weight
         };
 
-        let mut result = vec![];
-        for p in push_stat.into_iter() {
-            let mut end = end.clone();
-            end.total_send = p as u64;
-            result.push(EndSignal::new(end, weight.clone()));
-        }
-
-        result
+        push_stat.into_iter().map(move |p| (p, weight.clone()))
     }
 
     fn push_to(&mut self, index: usize, tag: Tag, buf: ReadBuffer<D>) -> IOResult<()> {
@@ -274,21 +267,12 @@ impl<D: Data> ExchangeMicroBatchPush<D> {
             would_block!("no buffer available in exchange;")
         } else {
             if let Some(end) = batch.take_end() {
+                assert!(end.peers.contains_source(self.src), "push illegal data without allow;");
                 self.flush_last_buffer(&batch.tag)?;
-                let result = self.update_end(None, &end);
-                if end.source.value() == 1 {
-                    assert!(self.scope_level > 0);
-                    for (i, e) in result.into_iter().enumerate() {
-                        let end = e.into_end();
-                        if end.total_send > 0 {
-                            let batch = MicroBatch::last(self.src, end);
-                            self.pushes[i].push(batch)?;
-                        }
-                    }
-                } else {
-                    for (i, e) in result.into_iter().enumerate() {
-                        self.pushes[i].notify_end(e)?;
-                    }
+                for (i, (pushed, children)) in self.update_end(None, &end).enumerate() {
+                    let mut new_end = end.clone();
+                    new_end.total_send = pushed as u64;
+                    self.pushes[i].sync_end(new_end, children)?;
                 }
             }
             Ok(())
@@ -326,128 +310,115 @@ impl<D: Data> Push<MicroBatch<D>> for ExchangeMicroBatchPush<D> {
         let len = batch.len();
 
         if len == 0 {
-            if let Some(mut end) = batch.take_end() {
+            if let Some(end) = batch.take_end() {
                 if level == self.scope_level {
-                    // this is an end of scope of current level;
-                    if end.source.value() == 1 {
-                        assert!(self.scope_level > 0);
-                        if batch.get_seq() == 0 {
-                            // an empty scope without any data;
-                            trace_worker!("output[{:?}] empty scope {:?};", self.port, batch.tag());
-                            let tag_cur = end.tag.current_uncheck() as u64;
-                            let owner = self.route.magic.exec(tag_cur) as usize;
-                            end.total_send = 0;
-                            end.source = Weight::single(self.src);
-                            self.pushes[owner].push(MicroBatch::last(self.src, end))?;
-                        } else {
-                            // source = 1, batch.seq > 0
-                            self.flush_last_buffer(batch.tag())?;
-                            let mut total_pushed = 0;
-                            for (i, sig) in self
-                                .update_end(None, &end)
-                                .into_iter()
-                                .enumerate()
-                            {
-                                let end = sig.into_end();
-                                if end.total_send > 0 {
-                                    total_pushed += end.total_send;
-                                    let last = MicroBatch::last(self.src, end);
-                                    self.pushes[i].push(last)?;
-                                }
-                            }
-                            if total_pushed == 0 {
-                                let tag_cur = end.tag.current_uncheck() as u64;
-                                let owner = self.route.magic.exec(tag_cur) as usize;
-                                end.total_send = 0;
-                                end.source = Weight::single(self.src);
-                                self.pushes[owner].push(MicroBatch::last(self.src, end))?;
-                            }
-                        }
-                    } else {
-                        if batch.get_seq() == 0 {
+                    if end.peers.value() == 0 {
+                        // handle empty stream
+                        let mut owner = 0;
+                        if level > 0 {
+                            owner = self.route.magic.exec(end.tag.current_uncheck() as u64) as u32;
+                        };
+                        if self.src == owner {
                             for p in self.pushes.iter_mut() {
-                                let children =
-                                    if end.tag.is_root() { Weight::all() } else { Weight::partial_empty() };
-                                let end = EndSignal::new(end.clone(), children);
-                                p.notify_end(end)?;
-                            }
-                        } else {
-                            self.flush_last_buffer(batch.tag())?;
-                            let sigs = self.update_end(None, &end);
-                            for (i, s) in sigs.into_iter().enumerate() {
-                                self.pushes[i].notify_end(s)?;
+                                let mut new_end = end.clone();
+                                new_end.total_send = 0;
+                                p.push_end(new_end, DynPeers::single(self.src))?;
                             }
                         }
+                        return Ok(())
                     }
-                } else {
-                    // this is an end of parent scope;
-                    if end.source.value() == 1 {
-                        end.source = Weight::all();
-                        batch.set_end(end);
+
+                    if batch.get_seq() == 0 {
+                        // it's the first batch need to be pushed on this port, and it's an empty batch;
+                        if !end.peers.contains_source(self.src) {
+                            return Ok(())
+                        }
+
                         for p in self.pushes.iter_mut() {
-                            p.push(batch.clone())?;
+                            let mut new_end = end.clone();
+                            new_end.total_send = 0;
+                            p.sync_end(new_end, DynPeers::empty())?;
                         }
                     } else {
-                        for p in self.pushes.iter_mut() {
-                            let sig = EndSignal::new(end.clone(), Weight::all());
-                            p.notify_end(sig)?;
+                        trace_worker!("begin assert;");
+                        assert!(end.peers.contains_source(self.src), "pushed invalid data without allow;");
+                        trace_worker!("end assert;");
+                        self.flush_last_buffer(batch.tag())?;
+                        for (i, (pushed, children)) in self.update_end(None, &end).enumerate() {
+                            let mut new_end = end.clone();
+                            new_end.total_send = pushed as u64;
+                            self.pushes[i].sync_end(new_end, children)?;
                         }
+                    };
+                } else {
+                    trace_worker!("sync");
+                    // this is an end of parent scope;
+                    for p in self.pushes.iter_mut() {
+                        let mut new_end = end.clone();
+                        new_end.total_send = 0;
+                        p.sync_end(new_end, DynPeers::all())?;
                     }
                 }
             } else {
-                warn_worker!("output[{:?}]: empty batch of {:?};", self.port, batch.tag);
+                warn_worker!("output[{:?}]: ignore empty batch of {:?};", self.port, batch.tag);
             }
             Ok(())
         } else if len == 1 {
             // only one data, not need re-batching;
             assert_eq!(level, self.scope_level);
-            if let Some(mut end) = batch.take_end() {
+            if let Some(end) = batch.take_end() {
+                assert!(end.peers.contains_source(self.src), "invalid data, can't push without allow;");
                 let x = batch
                     .get(0)
                     .expect("expect at least one entry as len = 1");
                 let target = self.route.route(x)? as usize;
-
                 if batch.get_seq() == 0 {
                     // only one data scope;
-                    if end.source.value() == 1 {
+                    if end.peers.value() == 1 {
                         assert!(level > 0);
-                        end.source = Weight::single(target as u32);
-                        batch.set_end(end);
-                        self.pushes[target].push(batch)?;
+                        for i in 1..self.pushes.len() {
+                            if i != target {
+                                let mut new_end = end.clone();
+                                new_end.total_send = 0;
+                                self.pushes[i].push_end(new_end, DynPeers::single(target as u32))?;
+                            }
+                        }
+                        let mut new_end = end.clone();
+                        new_end.total_send = 1;
+                        new_end.peers = DynPeers::single(target as u32);
+                        batch.set_end(new_end);
+                        self.pushes[target as usize].push(batch)?;
                     } else {
                         // multi source;
                         self.pushes[target].push(batch)?;
-                        let weight =
-                            if end.tag.is_root() { Weight::all() } else { Weight::single(target as u32) };
-                        let end = EndSignal::new(end, weight);
+                        let children = DynPeers::single(target as u32);
                         for i in 1..self.pushes.len() {
-                            self.pushes[i].notify_end(end.clone())?;
+                            self.pushes[i].sync_end(end.clone(), children.clone())?;
                         }
-                        self.pushes[0].notify_end(end)?;
+                        self.pushes[0].sync_end(end, children)?;
                     }
                 } else {
                     // flush previous buffered data;
                     self.flush_last_buffer(&batch.tag)?;
                     let result = self.update_end(Some(target), &end);
-                    if end.source.value() == 1 {
-                        assert!(self.scope_level > 0);
-                        for (i, e) in result.into_iter().enumerate() {
-                            let mut empty = MicroBatch::new(end.tag.clone(), self.src, ReadBuffer::new());
+                    if end.peers.value() == 1 {
+                        for (i, (pushed, children)) in result.enumerate() {
+                            let mut new_end = end.clone();
+                            new_end.total_send = pushed as u64;
                             if i == target {
-                                let mut batch = std::mem::replace(&mut batch, empty);
-                                batch.set_end(e.into_end());
+                                let mut batch = std::mem::replace(&mut batch, MicroBatch::empty());
+                                batch.set_end(new_end);
                                 self.pushes[i].push(batch)?;
                             } else {
-                                let end = e.into_end();
-                                if end.total_send > 0 {
-                                    empty.set_end(end);
-                                    self.pushes[i].push(empty)?;
-                                }
+                                self.pushes[i].push_end(new_end, children)?;
                             }
                         }
                     } else {
-                        for (i, e) in result.into_iter().enumerate() {
-                            self.pushes[i].notify_end(e)?;
+                        self.pushes[target].push(batch)?;
+                        for (i, (pushed, children)) in result.into_iter().enumerate() {
+                            let mut new_end = end.clone();
+                            new_end.total_send = pushed as u64;
+                            self.pushes[i].sync_end(new_end, children)?;
                         }
                     }
                 }
@@ -569,6 +540,7 @@ impl<D: Data> BlockPush for ExchangeMicroBatchPush<D> {
 
 pub struct ExchangeByScopePush<D: Data> {
     pub ch_info: ChannelInfo,
+    src: u32,
     pushes: Vec<EventEmitPush<D>>,
     magic: Magic,
     cancel_handle: DynSingleConsCancelPtr,
@@ -580,7 +552,8 @@ impl<D: Data> ExchangeByScopePush<D> {
         let len = pushes.len();
         let magic = Magic::new(len);
         let cancel_handle = DynSingleConsCancelPtr::new(ch_info.scope_level, len);
-        ExchangeByScopePush { ch_info, pushes, magic, cancel_handle }
+        let src = crate::worker_id::get_current_worker().index;
+        ExchangeByScopePush { ch_info, src, pushes, magic, cancel_handle }
     }
 
     pub(crate) fn get_cancel_handle(&self) -> CancelHandle {
@@ -605,8 +578,16 @@ impl<D: Data> Push<MicroBatch<D>> for ExchangeByScopePush<D> {
             }
 
             if let Some(mut end) = batch.take_end() {
-                if end.source.value() == 1 {
-                    end.source = Weight::single(target as u32);
+                if !end.peers.contains_source(self.src) {
+                    assert_eq!(batch.len(), 0);
+                    if end.peers.value() == 0 && target as u32 == self.src {
+                        end.peers = DynPeers::single(target as u32);
+                    }  else {
+                        return Ok(());
+                    }
+                }
+                if end.peers.value() == 1 {
+                    end.peers = DynPeers::single(target as u32);
                     batch.set_end(end);
                     self.pushes[target].push(batch)?;
                 } else {
@@ -614,8 +595,8 @@ impl<D: Data> Push<MicroBatch<D>> for ExchangeByScopePush<D> {
                         self.pushes[target].push(batch)?;
                     }
                     // only notify the target;
-                    let end = EndSignal::new(end, Weight::single(target as u32));
-                    self.pushes[target].notify_end(end)?;
+                    //let end = EndSyncSignal::new(end, DynChildren::single(target as u32));
+                    self.pushes[target].sync_end(end, DynPeers::single(target as u32))?;
                 }
             } else {
                 if !batch.is_empty() {
@@ -626,18 +607,9 @@ impl<D: Data> Push<MicroBatch<D>> for ExchangeByScopePush<D> {
             }
         } else {
             assert!(batch.is_empty());
-            if let Some(mut end) = batch.take_end() {
-                if end.source.value() == 1 {
-                    end.source = Weight::all();
-                    batch.set_end(end);
-                    for p in self.pushes.iter_mut() {
-                        p.push(batch.clone())?;
-                    }
-                } else {
-                    let end = EndSignal::new(end, Weight::all());
-                    for p in self.pushes.iter_mut() {
-                        p.notify_end(end.clone())?;
-                    }
+            if let Some(end) = batch.take_end() {
+                for p in self.pushes.iter_mut() {
+                    p.sync_end(end.clone(), DynPeers::all())?;
                 }
             } else {
                 // ignore empty batch;

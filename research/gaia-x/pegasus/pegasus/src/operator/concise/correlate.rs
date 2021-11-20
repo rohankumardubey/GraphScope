@@ -28,7 +28,7 @@ use crate::communication::output::{new_output, OutputProxy};
 use crate::data::{EndOfScope, MicroBatch};
 use crate::errors::{IOError, JobExecError};
 use crate::operator::{Notifiable, OperatorCore};
-use crate::progress::Weight;
+use crate::progress::DynPeers;
 use crate::stream::{Single, SingleItem, Stream};
 use crate::tag::tools::map::TidyTagMap;
 use crate::{BuildJobError, Data, Tag};
@@ -47,6 +47,7 @@ impl<D: Data> CorrelatedSubTask<D> for Stream<D> {
         T: Data,
         F: FnOnce(Stream<D>) -> Result<SingleItem<T>, BuildJobError>,
     {
+        self.sync_state()
         let entered = self.enter()?;
         let scope_level = entered.get_scope_level();
         let fork_guard = UnsafeRcPtr::new(RefCell::new(TidyTagMap::new(scope_level - 1)));
@@ -163,7 +164,7 @@ impl<D: Data> OperatorCore for ForkSubtaskOperator<D> {
                         let tag = Tag::inherit(&p, cur);
                         trace_worker!("fork scope {}th subtask {:?}", fp.forked_child, tag);
                         let mut sub_batch = new_batch(tag.clone(), worker, buf);
-                        let end = EndOfScope::new(tag, Weight::single(worker), 1);
+                        let end = EndOfScope::new(tag, DynPeers::single(worker), 1);
                         sub_batch.set_end(end);
                         output2.push_batch(sub_batch)?;
                         *in_progress += 1;

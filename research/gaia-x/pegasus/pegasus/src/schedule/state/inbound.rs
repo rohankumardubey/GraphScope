@@ -2,28 +2,28 @@ use crate::communication::IOResult;
 use crate::data::{EndOfScope, MicroBatch};
 use crate::data_plane::{GeneralPush, Push};
 use crate::graph::Port;
-use crate::progress::{EndSignal, Weight};
+use crate::progress::{EndSyncSignal, DynPeers};
 use crate::tag::tools::map::TidyTagMap;
 use crate::{Data, Tag};
 
 #[allow(dead_code)]
 struct ScopeEndPanel {
     tag: Tag,
-    source: Weight,
-    children: Weight,
-    merged: Weight,
+    source: DynPeers,
+    children: DynPeers,
+    merged: DynPeers,
     count: u64,
     is_exhaust: bool,
 }
 
 impl ScopeEndPanel {
-    fn new(src: u32, end: EndSignal) -> Self {
-        let mut merged = Weight::partial_empty();
+    fn new(src: u32, end: EndSyncSignal) -> Self {
+        let mut merged = DynPeers::empty();
         merged.add_source(src);
         let (end, children) = end.take();
         ScopeEndPanel {
             tag: end.tag,
-            source: end.source,
+            source: end.peers,
             children,
             merged,
             count: end.total_send,
@@ -31,29 +31,27 @@ impl ScopeEndPanel {
         }
     }
 
-    fn merge(&mut self, src: u32, end: EndSignal) -> Option<EndOfScope> {
+    fn merge(&mut self, src: u32, end: EndSyncSignal) -> Option<EndOfScope> {
         let (end, children) = end.take();
         assert_eq!(end.tag, self.tag);
-        assert_eq!(end.source, self.source);
+        assert_eq!(end.peers, self.source);
         self.merged.add_source(src);
         self.children.merge(children);
         self.count += end.total_send;
 
         if self.merged == self.source {
             self.is_exhaust = true;
-            let mut src = std::mem::replace(&mut self.children, Weight::partial_empty());
+            let mut src = std::mem::replace(&mut self.children, DynPeers::empty());
             if src.value() == 0 {
-                assert!(self.tag.len() > 0);
                 assert_eq!(self.count, 0);
                 // empty scope;
+                let mut owner = 0;
                 let worker_id = crate::worker_id::get_current_worker();
-                let owner = self.tag.current_uncheck() % worker_id.total_peers();
-                if owner == worker_id.index {
-                    src = Weight::single(owner);
-                    Some(EndOfScope::new(self.tag.clone(), src, self.count))
-                } else {
-                    None
+                if self.tag.len() > 0 {
+                    owner = self.tag.current_uncheck() % worker_id.total_peers();
                 }
+                src = DynPeers::single(owner);
+                Some(EndOfScope::new(self.tag.clone(), src, self.count))
             } else {
                 Some(EndOfScope::new(self.tag.clone(), src, self.count))
             }
@@ -102,10 +100,12 @@ impl InboundStreamState {
         InboundStreamState { port, scope_level, notify_guards, notify }
     }
 
-    pub fn on_end(&mut self, src: u32, end: EndSignal) -> IOResult<()> {
+    pub fn on_end(&mut self, src: u32, end: EndSyncSignal) -> IOResult<()> {
         if end.sources() == 1 {
-            trace_worker!("scope {:?} end[source = 1] should be be passed with data;", end.tag());
-            return self.notify.notify(end.into_end());
+            let (mut end, child) = end.take();
+            trace_worker!("input[{:?}] get end of {:?}, total pushed {}, peers: {:?}=>{:?}", self.port, end.tag, end.total_send, end.peers, child);
+            end.peers = child;
+            return self.notify.notify(end);
         }
 
         let idx = end.tag().len();
@@ -129,11 +129,11 @@ impl InboundStreamState {
 
         if let Some(mut p) = self.notify_guards[idx].remove(end.tag()) {
             if let Some(e) = p.merge(src, end) {
-                trace_worker!("in port {:?} get end of {:?}", self.port, e.tag);
+                trace_worker!("input[{:?}] get end of {:?}, total pushed {}, peers: {:?}", self.port, e.tag, e.total_send, e.peers);
                 self.notify.notify(e)?;
             } else {
                 trace_worker!(
-                    "in port {:?} partial end of {:?}, expect {:?}, current {:?};",
+                    "input[{:?}] partial end of {:?}, expect {:?}, current {:?};",
                     self.port,
                     p.tag,
                     p.source,

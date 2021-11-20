@@ -319,18 +319,16 @@ impl<D: Data> Stream<D> {
     }
 
     pub fn enter(mut self) -> Result<Self, BuildJobError> {
-        if let Some(_delta) = self.ch.add_delta(ScopeDelta::ToChild(1)) {
-            let forward = self.forward("forward_enter")?;
-            forward.enter()
+        if !self.ch.is_pipeline() || self.ch.add_delta(ScopeDelta::ToChild(1)).is_some() {
+            self.forward("enter_adapter")?.enter()
         } else {
             Ok(self)
         }
     }
 
     pub fn leave(mut self) -> Result<Self, BuildJobError> {
-        if let Some(_) = self.ch.add_delta(ScopeDelta::ToParent(1)) {
-            let forward = self.forward("forward_leave")?;
-            forward.leave()
+        if !self.ch.is_pipeline() || self.ch.add_delta(ScopeDelta::ToParent(1)).is_some() {
+            self.forward("leave_adapter")?.leave()
         } else {
             Ok(self)
         }

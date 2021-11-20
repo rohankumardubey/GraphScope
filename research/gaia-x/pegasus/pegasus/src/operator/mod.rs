@@ -191,19 +191,16 @@ impl DefaultNotify {
 }
 
 pub struct DefaultNotifyOperator<T> {
-    worker_index: u32,
-    worker_peers: u32,
-    op_index: usize,
     op: T,
     notify: DefaultNotify,
 }
 
 impl<T> DefaultNotifyOperator<T> {
-    fn new(op_index: usize, input_size: usize, output_size: usize, scope_level: u32, op: T) -> Self {
+    fn new(_op_index: usize, input_size: usize, output_size: usize, scope_level: u32, op: T) -> Self {
         let notify = DefaultNotify::new(input_size, output_size, scope_level);
-        let worker_index = crate::worker_id::get_current_worker().index;
-        let worker_peers = crate::worker_id::get_current_worker().total_peers();
-        DefaultNotifyOperator { worker_index, worker_peers, op_index, op, notify }
+        //let worker_index = crate::worker_id::get_current_worker().index;
+        //let worker_peers = crate::worker_id::get_current_worker().total_peers();
+        DefaultNotifyOperator { op, notify }
     }
 }
 
@@ -212,22 +209,6 @@ impl<T: Send + 'static> Notifiable for DefaultNotifyOperator<T> {
         if !outputs.is_empty() {
             let merged = self.notify.merge_end(n);
             for end in merged {
-                if !end.tag.is_root() && !end.contains_source(self.worker_index) {
-                    let owner = end.tag.current_uncheck() % self.worker_peers;
-                    if owner != self.worker_index {
-                        trace_worker!(
-                            "operator {} ignore scope end of {:?} source = {:?}, count = {};",
-                            self.op_index,
-                            end.tag,
-                            end.source,
-                            end.total_send
-                        );
-                        continue;
-                    }
-                    // if end.source.value() != 1 {
-                    //     continue;
-                    // }
-                }
                 if outputs.len() > 1 {
                     for i in 1..outputs.len() {
                         outputs[i].notify_end(end.clone())?;

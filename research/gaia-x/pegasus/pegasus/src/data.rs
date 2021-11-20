@@ -19,7 +19,7 @@ use pegasus_common::buffer::{Buffer, ReadBuffer};
 use pegasus_common::codec::{Decode, Encode};
 use pegasus_common::io::{ReadExt, WriteExt};
 
-use crate::progress::Weight;
+use crate::progress::DynPeers;
 use crate::tag::Tag;
 
 pub trait Data: Clone + Send + Sync + Debug + Encode + Decode + 'static {}
@@ -28,23 +28,23 @@ impl<T: Clone + Send + Sync + Debug + Encode + Decode + 'static> Data for T {}
 #[derive(Clone)]
 pub struct EndOfScope {
     pub(crate) tag: Tag,
-    pub(crate) source: Weight,
+    pub(crate) peers: DynPeers,
     pub(crate) total_send: u64,
 }
 
 impl EndOfScope {
-    pub(crate) fn new(tag: Tag, source: Weight, count: u64) -> Self {
-        EndOfScope { tag, source, total_send: count }
+    pub(crate) fn new(tag: Tag, source: DynPeers, count: u64) -> Self {
+        EndOfScope { tag, peers: source, total_send: count }
     }
 
     pub(crate) fn merge(&mut self, other: EndOfScope) {
         assert_eq!(self.tag, other.tag);
-        self.source.merge(other.source);
+        self.peers.merge(other.peers);
         self.total_send += other.total_send;
     }
 
     pub(crate) fn contains_source(&self, src: u32) -> bool {
-        self.total_send != 0 || self.source.contains_source(src)
+        self.peers.value() > 0 && (self.total_send > 0 || self.peers.contains_source(src))
     }
 }
 
@@ -57,7 +57,7 @@ impl Debug for EndOfScope {
 impl Encode for EndOfScope {
     fn write_to<W: WriteExt>(&self, writer: &mut W) -> std::io::Result<()> {
         self.tag.write_to(writer)?;
-        self.source.write_to(writer)?;
+        self.peers.write_to(writer)?;
         writer.write_u64(self.total_send)
     }
 }
@@ -65,9 +65,9 @@ impl Encode for EndOfScope {
 impl Decode for EndOfScope {
     fn read_from<R: ReadExt>(reader: &mut R) -> std::io::Result<Self> {
         let tag = Tag::read_from(reader)?;
-        let source = Weight::read_from(reader)?;
+        let source = DynPeers::read_from(reader)?;
         let total_send = reader.read_u64()?;
-        Ok(EndOfScope { tag, source, total_send })
+        Ok(EndOfScope { tag, peers: source, total_send })
     }
 }
 

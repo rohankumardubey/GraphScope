@@ -26,8 +26,8 @@ use crate::errors::IOError;
 use crate::event::emitter::EventEmitter;
 use crate::event::{Event, EventKind};
 use crate::graph::Port;
-use crate::progress::EndSignal;
-use crate::progress::Weight;
+use crate::progress::EndSyncSignal;
+use crate::progress::DynPeers;
 use crate::tag::tools::map::TidyTagMap;
 use crate::{Data, Tag};
 pub mod aggregate;
@@ -74,7 +74,7 @@ pub trait BlockPush {
 #[allow(dead_code)]
 pub struct LocalMicroBatchPush<T: Data> {
     pub ch_info: ChannelInfo,
-    pub worker_index: u32,
+    pub src: u32,
     inner: ThreadPush<MicroBatch<T>>,
     event_emit: EventEmitter,
     global_state: bool,
@@ -88,7 +88,7 @@ impl<T: Data> LocalMicroBatchPush<T> {
         let worker_index = crate::worker_id::get_current_worker().index;
         LocalMicroBatchPush {
             ch_info,
-            worker_index,
+            src: worker_index,
             inner: push,
             event_emit,
             global_state: false,
@@ -103,22 +103,24 @@ impl<T: Data> LocalMicroBatchPush<T> {
 
 impl<T: Data> Push<MicroBatch<T>> for LocalMicroBatchPush<T> {
     fn push(&mut self, mut batch: MicroBatch<T>) -> IOResult<()> {
-        if let Some(mut end) = batch.take_end() {
-            let mut c = self
-                .push_counts
-                .remove(&batch.tag)
-                .unwrap_or((0, 0));
-            c.1 += batch.len();
-            if batch.is_empty() {
-                trace_worker!(
+        let level = batch.tag().len() as u32;
+        if level == self.ch_info.scope_level {
+            if let Some(mut end) = batch.take_end() {
+                let mut c = self
+                    .push_counts
+                    .remove(&batch.tag)
+                    .unwrap_or((0, 0));
+                c.1 += batch.len();
+                if batch.is_empty() {
+                    trace_worker!(
                     "output[{:?}] push end of {:?} to channel[{}] to self, total pushed {};",
                     self.ch_info.source_port,
                     batch.tag,
                     self.ch_info.index(),
                     c.1
                 )
-            } else {
-                trace_worker!(
+                } else {
+                    trace_worker!(
                     "output[{:?}] push last batch(len={}) of {:?} to channel[{}] to self, total pushed {};",
                     self.ch_info.source_port,
                     batch.len(),
@@ -126,45 +128,63 @@ impl<T: Data> Push<MicroBatch<T>> for LocalMicroBatchPush<T> {
                     self.ch_info.id.index,
                     c.1
                 );
-            }
-            end.total_send = c.1 as u64;
+                }
+                end.total_send = c.1 as u64;
 
-            if self.global_state {
-                let worker = self.worker_index;
-                let port = self.ch_info.target_port;
-
-                if end.source.value() == 1 {
-                    let event = Event::new(
-                        worker,
-                        port,
-                        EventKind::End(EndSignal::new(end.clone(), Weight::partial_current())),
-                    );
-                    for i in 0..self.event_emit.peers() as u32 {
-                        if i != worker {
-                            self.event_emit.send(i, event.clone())?;
+                if self.global_state {
+                    let worker = self.src;
+                    let port = self.ch_info.target_port;
+                    if !end.contains_source(worker) {
+                        assert!(batch.is_empty());
+                        assert_eq!(c.1, 0);
+                        if end.peers.value() == 0 {
+                            let mut owner = 0;
+                            if level > 0 {
+                                let peers = crate::worker_id::get_current_worker().total_peers();
+                                owner = end.tag.current_uncheck() % peers;
+                            }
+                            if owner == self.src {
+                                end.peers = DynPeers::single(self.src);
+                            } else {
+                                return Ok(());
+                            }
+                        } else {
+                            return Ok(())
                         }
                     }
-                    batch.set_end(end);
-                } else {
-                    if !batch.is_empty() {
-                        self.inner.push(batch)?;
+
+                    if end.peers.value() == 1 {
+                        let event = Event::new(
+                            worker,
+                            port,
+                            EventKind::End(EndSyncSignal::new(end.clone(), DynPeers::partial_current())),
+                        );
+                        for i in 0..self.event_emit.peers() as u32 {
+                            if i != worker {
+                                self.event_emit.send(i, event.clone())?;
+                            }
+                        }
+                        batch.set_end(end);
+                    } else {
+                        if !batch.is_empty() {
+                            self.inner.push(batch)?;
+                        }
+                        let event = Event::new(
+                            worker,
+                            port,
+                            EventKind::End(EndSyncSignal::new(end, DynPeers::partial_current())),
+                        );
+                        return self.event_emit.broadcast(event);
                     }
-                    let event = Event::new(
-                        worker,
-                        port,
-                        EventKind::End(EndSignal::new(end, Weight::partial_current())),
-                    );
-                    return self.event_emit.broadcast(event);
+                } else {
+                    batch.set_end(end);
                 }
             } else {
-                batch.set_end(end);
+                let c = self.push_counts.get_mut_or_insert(&batch.tag);
+                c.0 += batch.len();
+                c.1 += batch.len();
             }
-        } else {
-            let c = self.push_counts.get_mut_or_insert(&batch.tag);
-            c.0 += batch.len();
-            c.1 += batch.len();
         }
-
         self.inner.push(batch)
     }
 

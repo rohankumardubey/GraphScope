@@ -31,7 +31,7 @@ use crate::errors::{BuildJobError, JobExecError};
 use crate::event::emitter::EventEmitter;
 use crate::event::Event;
 use crate::graph::Port;
-use crate::progress::Weight;
+use crate::progress::DynPeers;
 use crate::resource::{KeyedResources, ResourceMap};
 use crate::result::ResultSink;
 use crate::schedule::Schedule;
@@ -101,7 +101,7 @@ impl<D: Data, T: Debug + Send + 'static> Worker<D, T> {
         let root = Box::new(root_builder)
             .build()
             .expect("no output;");
-        let end = EndOfScope::new(Tag::Root, Weight::all(), 0);
+        let end = EndOfScope::new(Tag::Root, DynPeers::all(), 0);
         root.notify_end(end).ok();
         root.close().ok();
         Ok(())
@@ -123,7 +123,6 @@ impl<D: Data, T: Debug + Send + 'static> Worker<D, T> {
         false
     }
 
-    #[cfg(not(feature = "mem"))]
     fn release(&mut self) {
         self.peer_guard.fetch_sub(1, Ordering::SeqCst);
     }

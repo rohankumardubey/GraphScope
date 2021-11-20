@@ -307,9 +307,8 @@ fn apply_flatmap_limit_unexpected_results2() {
     })
         .expect("build job failure");
 
-    while let Some(Ok(cnt)) = result.next() {
-        assert_eq!(cnt, expected_cnt);
-    }
+    let cnt = result.next().unwrap().unwrap();
+    assert_eq!(cnt, expected_cnt);
 }
 
 #[test]
